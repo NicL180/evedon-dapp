@@ -2,6 +2,8 @@ import './globals.css';
 import type { Metadata } from 'next';
 import Script from 'next/script';
 import Analytics from './analytics';
+import { Suspense } from 'react';
+
 
 export const metadata: Metadata = {
   title: 'Evedon',
@@ -28,7 +30,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         </Script>
       </head>
       <body>
-        <Analytics />
+        <Suspense fallback={null}>
+  <Analytics />
+</Suspense>
+
         {children}
       </body>
     </html>
