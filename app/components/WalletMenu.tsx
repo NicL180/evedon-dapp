@@ -30,7 +30,7 @@ function networkName(id: number | null | undefined) {
 
 export default function WalletMenu() {
   const { connected, name, connect, disconnect } = useWallet();
-  const hookAddress = useAddress();          // may be null with wallet privacy
+  const hookAddress = useAddress(); // may be null with wallet privacy
   const netId = useNetwork();
   const lovelace = useLovelace();
   const ada = useMemo(() => formatAda(lovelace), [lovelace]);
@@ -41,10 +41,33 @@ export default function WalletMenu() {
   const [fallbackAddr, setFallbackAddr] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  // Discover installed wallets
+  // Scan for injected wallets (immediately + delayed polls for late injection)
+  useEffect(() => {
+    const scan = () => {
+      const w = (globalThis as any).cardano || {};
+      setInstalled(CANDIDATES.filter(c => !!w[c.id]));
+    };
+    scan();
+    const t1 = setTimeout(scan, 300);
+    const t2 = setTimeout(scan, 1000);
+    const t3 = setTimeout(scan, 2000);
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); };
+  }, []);
+
+  // Auto-reconnect if a wallet is already authorized (reduces "no wallets detected" confusion)
   useEffect(() => {
     const w = (globalThis as any).cardano || {};
-    setInstalled(CANDIDATES.filter(c => !!w[c.id]));
+    (async () => {
+      try {
+        for (const id of CANDIDATES.map(c => c.id)) {
+          if (await w[id]?.isEnabled?.()) {
+            await connect(id as any);
+            break;
+          }
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Close dropdown on outside click / ESC
@@ -56,10 +79,9 @@ export default function WalletMenu() {
     return () => { document.removeEventListener('click', onClick); document.removeEventListener('keydown', onKey); };
   }, []);
 
-  // Robust address fallback using CSL (no 90-char limit)
+  // Robust address fallback using CSL (if wallet privacy hides it from Mesh hook)
   useEffect(() => {
     let cancelled = false;
-
     async function deriveAddress() {
       setFallbackAddr(null);
       if (!connected || hookAddress) return;
@@ -70,42 +92,28 @@ export default function WalletMenu() {
       for (const id of CANDIDATES.map(c => c.id)) {
         try { if (await w[id]?.isEnabled?.()) { providerId = id; break; } } catch {}
       }
-      // fallback to Mesh wallet name if needed
-      if (!providerId && name) {
-        const guess = String(name).toLowerCase();
-        if (w[guess]) providerId = guess;
-      }
       if (!providerId || !w[providerId]) return;
 
       try {
         const api = await w[providerId].enable();
-        // get change or first used address (hex)
         let hex: string | null = null;
         try { hex = await api.getChangeAddress(); } catch {}
         if (!hex) {
           const used: string[] = await api.getUsedAddresses().catch(() => []);
           if (used?.length) hex = used[0];
         }
-        if (!hex) { console.debug('[addr] wallet returned no change/used'); return; }
+        if (!hex) return;
 
-        // dynamic import (bundled by Next; loads WASM correctly)
         const CSL = await import('@emurgo/cardano-serialization-lib-browser');
         const bytes = hex2bytes(hex);
         const prefix = (await api.getNetworkId().catch(() => netId)) === 1 ? 'addr' : 'addr_test';
         const bech = CSL.Address.from_bytes(bytes).to_bech32(prefix);
-
-        if (!cancelled) {
-          console.debug('[addr] fallback bech32 via CSL:', bech);
-          setFallbackAddr(bech);
-        }
-      } catch (e) {
-        console.error('[addr] CSL fallback error', e);
-      }
+        if (!cancelled) setFallbackAddr(bech);
+      } catch {}
     }
-
     deriveAddress();
     return () => { cancelled = true; };
-  }, [connected, hookAddress, netId, name]);
+  }, [connected, hookAddress, netId]);
 
   const displayAddress = hookAddress ?? fallbackAddr ?? null;
 
@@ -116,7 +124,6 @@ export default function WalletMenu() {
 
   return (
     <div className="wallet-menu" ref={menuRef}>
-      {/* Connect / switch */}
       <button
         type="button"
         className="wallet-menu__button"
@@ -139,7 +146,6 @@ export default function WalletMenu() {
           >
             {showAddress ? '👁️' : '🙈'}
           </button>
-
           {showAddress && (
             <>
               <span className="wallet-menu__addr-text">{displayAddress ?? '—'}</span>
@@ -167,24 +173,30 @@ export default function WalletMenu() {
       {/* Dropdown */}
       {open && (
         <div className="wallet-menu__dropdown" role="menu">
-          {!connected && (
+          {!connected ? (
             <>
-              {installed.length ? installed.map(w => (
-                <button
-                  key={w.id}
-                  role="menuitem"
-                  className="wallet-menu__item"
-                  onClick={async () => {
-                    try { await connect(w.id); setOpen(false); } catch (e) { console.error('Connect error', e); }
-                  }}
-                >
-                  {w.label}
-                </button>
-              )) : <div className="wallet-menu__empty">No wallets detected</div>}
+              {installed.length ? (
+                installed.map(w => (
+                  <button
+                    key={w.id}
+                    role="menuitem"
+                    className="wallet-menu__item"
+                    onClick={async () => {
+                      try { await connect(w.id as any); setOpen(false); } catch (e) { console.error('Connect error', e); }
+                    }}
+                  >
+                    {w.label}
+                  </button>
+                ))
+              ) : (
+                // Hide this entire "no wallets" section once connected; only show when not connected
+                <div className="wallet-menu__empty">
+                  No wallets detected. Install Lace and refresh.
+                  {' '}<a href="https://lace.io" target="_blank" rel="noreferrer">Get Lace</a>
+                </div>
+              )}
             </>
-          )}
-
-          {connected && (
+          ) : (
             <>
               <div className="wallet-menu__status">Connected: {name ?? 'Wallet'}</div>
               <button
@@ -198,18 +210,18 @@ export default function WalletMenu() {
               </button>
               <div className="wallet-menu__sep" />
               <div className="wallet-menu__subhead">Switch wallet</div>
-              {installed.map(w => (
+              {installed.length ? installed.map(w => (
                 <button
                   key={w.id}
                   role="menuitem"
                   className="wallet-menu__item"
                   onClick={async () => {
-                    try { await connect(w.id); setOpen(false); setShowAddress(false); } catch (e) { console.error('Switch error', e); }
+                    try { await connect(w.id as any); setOpen(false); setShowAddress(false); } catch (e) { console.error('Switch error', e); }
                   }}
                 >
                   {w.label}
                 </button>
-              ))}
+              )) : <div className="wallet-menu__empty">No other wallets detected</div>}
             </>
           )}
         </div>
