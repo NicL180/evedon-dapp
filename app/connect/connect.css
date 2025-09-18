@@ -1,0 +1,20 @@
+.connect-btn {
+  position: absolute;
+  top: 20px;             /* one button height (~40px) down */
+  right: 20px;           /* one button length away from screen edge */
+  background: black;     /* background to contrast the neon */
+  color: #00f0ff;        /* neon blue text */
+  font-weight: bold;
+  padding: 0.6rem 1.2rem;
+  border: 2px solid #00f0ff;
+  border-radius: 8px;
+  text-shadow: 0 0 6px #00f0ff, 0 0 12px #00f0ff;
+  transition: all 0.2s ease;
+}
+
+.connect-btn:hover {
+  background: #00f0ff;
+  color: black;
+  box-shadow: 0 0 12px #00f0ff, 0 0 24px #00f0ff;
+  cursor: pointer;
+}
