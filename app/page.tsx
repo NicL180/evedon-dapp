@@ -1,8 +1,7 @@
 export default function HomePage() {
   return (
     <main style={{ padding: '2rem', textAlign: 'center' }}>
-      {/* Empty for now – header already shows title */}
+      {/* Intentionally minimal — header + wallet menu come from layout.tsx */}
     </main>
   );
 }
-yield

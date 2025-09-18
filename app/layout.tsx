@@ -6,6 +6,8 @@ import { Suspense } from 'react';
 import Providers from './providers';
 import WalletMenu from './components/WalletMenu';
 
+
+
 export const metadata: Metadata = {
   title: 'Evedon',
   description: 'Evedon dApp',
@@ -34,7 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       </head>
       <body>
         <Providers>
-          {/* Title bar (your existing header is fine; keep or replace as you like) */}
+          {/* Title bar */}
           <header
             style={{
               textAlign: 'center',
@@ -44,21 +46,21 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             }}
           >
             <h1
-                style={{
-    fontSize: '2.5rem',
-    fontWeight: 800,
-    margin: 0,
-    fontFamily: '"Orbitron", sans-serif',
-    letterSpacing: '2px',
-    color: '#00f0ff',
-    textShadow: '0 0 10px #00f0ff, 0 0 20px #00f0ff',
-  }}
->
-  Welcome to Evedon Games
+              style={{
+                fontSize: '2.5rem',
+                fontWeight: 800,
+                margin: 0,
+                fontFamily: '"Orbitron", sans-serif',
+                letterSpacing: '2px',
+                color: '#00f0ff',
+                textShadow: '0 0 10px #00f0ff, 0 0 20px #00f0ff',
+              }}
+            >
+              Welcome to Evedon Games
             </h1>
           </header>
 
-          {/* 🔵 Neon Connect Wallet — fixed top-right */}
+          {/* 🔵 Neon Connect Wallet menu (fixed top-right) */}
           <WalletMenu />
 
           <Suspense fallback={null}>
@@ -71,4 +73,3 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
-t
