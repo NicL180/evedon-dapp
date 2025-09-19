@@ -2,16 +2,14 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useWallet, useNetwork } from '@meshsdk/react';
-import { Transaction } from '@meshsdk/core';
+import { BlockfrostProvider, MeshTxBuilder } from '@meshsdk/core';
 
-// ------- helpers -------
+// ---------- helpers ----------
 const hrp = (netId: number | null | undefined) => (netId === 1 ? 'addr' : 'addr_test');
 const toHex = (u8: Uint8Array) => Array.from(u8).map(b => b.toString(16).padStart(2, '0')).join('');
 function toBytes(v: unknown): Uint8Array {
   if (typeof v === 'string') {
-    // if wallet gave bech32, we handle elsewhere
     if (v.startsWith('addr')) throw new Error('BECH32_STRING');
-    // hex (optionally 0x-prefixed)
     const clean = v.startsWith('0x') ? v.slice(2) : v;
     if (!/^[0-9a-fA-F]+$/.test(clean)) throw new Error('Not hex');
     const out = new Uint8Array(clean.length / 2);
@@ -23,32 +21,51 @@ function toBytes(v: unknown): Uint8Array {
   if (v && typeof v === 'object' && typeof (v as any).hex === 'string') return toBytes((v as any).hex);
   throw new Error('Unsupported address data');
 }
+const niceErr = (e: any) =>
+  e?.info?.error?.message || e?.info?.message || e?.message || 'Failed to build/sign/submit.';
 
+// ---------- component ----------
 export default function ScriptSigClient() {
-  const { connected, name, wallet } = useWallet() as any; // CIP-30 via Mesh
+  const { connected, name, wallet } = useWallet() as any; // CIP-30
   const netId = useNetwork();
 
-  const [bech32, setBech32] = useState<string | null>(null);
+  const [baseBech, setBaseBech] = useState<string | null>(null);
   const [keyHashHex, setKeyHashHex] = useState<string | null>(null);
   const [scriptCbor, setScriptCbor] = useState<string | null>(null);
   const [scriptAddr, setScriptAddr] = useState<string | null>(null);
-  const [amountAda, setAmountAda] = useState('1.0');
+
+  const [availableAda, setAvailableAda] = useState<number | null>(null);
+  const [safeMaxAda, setSafeMaxAda] = useState<number | null>(null);
+
+  const [amountAda, setAmountAda] = useState('1.0'); // recommend >= 1.0 ADA
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [txHash, setTxHash] = useState<string | null>(null);
 
   const explorerBase = useMemo(
     () => (netId === 1 ? 'https://cardanoscan.io' : 'https://preprod.cardanoscan.io'),
     [netId]
   );
+  const cexplorerBase = useMemo(
+    () => (netId === 1 ? 'https://cexplorer.io' : 'https://preprod.cexplorer.io'),
+    [netId]
+  );
 
-  // Load base address, derive key hash, build native script, and make a script address
+  // Use Blockfrost for UTxOs (avoid wallet privacy limits)
+  const provider = useMemo(
+    () => new BlockfrostProvider(process.env.NEXT_PUBLIC_BLOCKFROST_KEY_PREPROD || ''),
+    []
+  );
+
+  // 1) Derive base address, key hash, native script, and script address
   useEffect(() => {
     let cancelled = false;
-    async function load() {
+    (async () => {
       try {
         if (!connected || !wallet) return;
+        const CSL = await import('@emurgo/cardano-serialization-lib-browser');
 
-        // 1) Get an address (change or first used)
+        // read a wallet address (bech32 or bytes/hex)
         let raw: any = null;
         try { raw = await wallet.getChangeAddress(); } catch {}
         if (!raw) {
@@ -57,96 +74,150 @@ export default function ScriptSigClient() {
         }
         if (!raw) return;
 
-        const CSL = await import('@emurgo/cardano-serialization-lib-browser');
-
-        // 2) Parse bech32 or bytes/hex to CSL.Address
         let addr: any;
         if (typeof raw === 'string' && raw.startsWith('addr')) {
           addr = CSL.Address.from_bech32(raw);
         } else {
-          const bytes = toBytes(raw);
-          addr = CSL.Address.from_bytes(bytes);
+          addr = CSL.Address.from_bytes(toBytes(raw));
         }
 
-        const addrBech = addr.to_bech32(hrp(netId));
+        const bech = addr.to_bech32(hrp(netId));
         if (cancelled) return;
-        setBech32(addrBech);
+        setBaseBech(bech);
 
-        // 3) Extract payment credential from Base | Enterprise | Pointer
+        // payment credential from Base | Enterprise | Pointer
         let cred: any = null;
         const base = CSL.BaseAddress.from_address(addr);
         if (base) cred = base.payment_cred();
-        if (!cred) {
-          const ent = CSL.EnterpriseAddress.from_address(addr);
-          if (ent) cred = ent.payment_cred();
-        }
-        if (!cred) {
-          const ptr = CSL.PointerAddress.from_address(addr);
-          if (ptr) cred = ptr.payment_cred();
-        }
-        if (!cred) throw new Error('Unsupported address kind for extracting payment credential');
+        if (!cred) { const ent = CSL.EnterpriseAddress.from_address(addr); if (ent) cred = ent.payment_cred(); }
+        if (!cred) { const ptr = CSL.PointerAddress.from_address(addr); if (ptr) cred = ptr.payment_cred(); }
+        if (!cred) throw new Error('Unsupported address kind');
 
         const kh = cred.to_keyhash();
-        if (!kh) throw new Error('Payment credential is not a key hash');
-        const khHex = toHex(kh.to_bytes());
-        setKeyHashHex(khHex);
+        const pkhHex = toHex(kh.to_bytes());
+        setKeyHashHex(pkhHex);
 
-        // 4) Build native script requiring that key
+        // native script (signature)
         const pub = CSL.ScriptPubkey.new(kh);
-        const ns = CSL.NativeScript.new_script_pubkey(pub);
+        const ns  = CSL.NativeScript.new_script_pubkey(pub);
         setScriptCbor(toHex(ns.to_bytes()));
 
-        // 5) Derive script address (Enterprise, fallback Base with your stake cred)
+        // script address (enterprise via Credential API)
         const networkTag = netId === 1 ? 1 : 0;
-        const hash = ns.hash();
-        // IMPORTANT: use Credential in newer CSL
-        const scrCred = CSL.Credential.from_scripthash(hash);
-
-        let derived: string | null = null;
-        try {
-          const ent = CSL.EnterpriseAddress.new(networkTag, scrCred);
-          derived = ent.to_address().to_bech32(hrp(netId));
-        } catch {}
-
-        if (!derived && base) {
-          try {
-            const scrBase = CSL.BaseAddress.new(networkTag, scrCred, base.stake_cred());
-            derived = scrBase.to_address().to_bech32(hrp(netId));
-          } catch {}
-        }
-
-        if (!derived) throw new Error('Could not derive script address');
-        setScriptAddr(derived);
+        const scrCred = CSL.Credential.from_scripthash(ns.hash());
+        const entAddr = CSL.EnterpriseAddress.new(networkTag, scrCred).to_address();
+        setScriptAddr(entAddr.to_bech32(hrp(netId)));
       } catch (e) {
-        console.error('[sig-script] init error', e);
+        console.error('[sig] init', e);
       }
-    }
-    load();
+    })();
     return () => { cancelled = true; };
   }, [connected, wallet, netId]);
 
+  // 2) Fetch wallet balance (via Blockfrost) and compute SAFE MAX
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!baseBech) return;
+        const utxos = await provider.fetchAddressUTxOs(baseBech);
+        const sum = utxos.reduce((acc: number, u: any) => {
+          const q = Number(u.output.amount.find((a: any) => a.unit === 'lovelace')?.quantity ?? '0');
+          return acc + q;
+        }, 0);
+        const ada = sum / 1_000_000;
+        if (cancelled) return;
+        setAvailableAda(ada);
+
+        // SAFE MAX: leave 0.8 ADA or 10% buffer for fees/change/min-UTxO
+        const buffer = Math.max(0.8, ada * 0.10);
+        setSafeMaxAda(Number(Math.max(0, ada - buffer).toFixed(6)));
+      } catch (e) {
+        console.error('[sig] balance', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [baseBech, provider]);
+
+  // 3) Build & submit using EXPLICIT UTxOs from Blockfrost (not the wallet)
   async function lockFunds(e: React.FormEvent) {
     e.preventDefault();
-    setMsg(null);
-    if (!connected || !wallet) { setMsg('Connect your wallet first.'); return; }
-    if (!scriptAddr) { setMsg('Script address not ready yet.'); return; }
+    setMsg(null); setTxHash(null);
 
-    const ada = Number(amountAda);
-    if (!Number.isFinite(ada) || ada <= 0) { setMsg('Enter a positive ADA amount.'); return; }
+    if (!connected || !wallet) { setMsg('Connect your wallet first.'); return; }
+    if (!scriptAddr || !baseBech) { setMsg('Addresses not ready yet.'); return; }
+
+    const amt = Number(amountAda);
+    if (!Number.isFinite(amt) || amt <= 0) { setMsg('Enter a positive ADA amount.'); return; }
+    if (amt < 1.0) { setMsg('Use ≥ 1.0 ADA to satisfy min-UTxO at the script address.'); return; }
+    if (safeMaxAda !== null && amt > safeMaxAda) {
+      setMsg(`Amount too high. Safe max ~${safeMaxAda.toFixed(6)} ADA. Try the “Use max” button.`);
+      return;
+    }
 
     setBusy(true);
     try {
-      const lovelace = Math.round(ada * 1_000_000).toString();
-      const tx = new Transaction({ initiator: wallet });
-      tx.sendLovelace(scriptAddr, lovelace);
+      const changeHex = await wallet.getChangeAddress();
+      const want = Math.round(amt * 1_000_000);
 
-      const unsigned = await tx.build();
-      const signed = await wallet.signTx(unsigned);
-      const hash = await wallet.submitTx(signed);
-      setMsg(`✅ Submitted lock tx. Hash: ${hash} · ${explorerBase}/transaction/${hash}`);
+      // Fetch UTxOs and pick enough to cover output + fee buffer (~1.5 ADA)
+      const utxos = await provider.fetchAddressUTxOs(baseBech);
+      const sorted = [...utxos].sort((a, b) =>
+        Number(b.output.amount.find((x: any) => x.unit === 'lovelace')?.quantity ?? '0') -
+        Number(a.output.amount.find((x: any) => x.unit === 'lovelace')?.quantity ?? '0')
+      );
+
+      const need = want + 1_500_000; // 1.5 ADA fee/change buffer
+      let picked: any[] = [];
+      let total = 0;
+      for (const u of sorted) {
+        const q = Number(u.output.amount.find((x: any) => x.unit === 'lovelace')?.quantity ?? '0');
+        picked.push(u);
+        total += q;
+        if (total >= need) break;
+      }
+      if (total < need) {
+        throw new Error('Not enough ADA in selected UTxOs. Try a smaller amount.');
+      }
+
+      // Build with explicit inputs
+      const txb = new MeshTxBuilder({ fetcher: provider, verbose: true });
+      txb.setNetwork('preprod');
+
+      // add picked inputs
+      for (const u of picked) {
+        txb.txIn(u.input.txHash, u.input.outputIndex, u.output.amount, u.output.address);
+      }
+
+      // output to script + change back to wallet
+      txb
+        .txOut(String(scriptAddr), [{ unit: 'lovelace', quantity: String(want) }])
+        .changeAddress(changeHex);
+
+      const unsigned = await txb.complete();         // no wallet selection needed now
+      const signed   = await wallet.signTx(unsigned);
+      const hash     = await wallet.submitTx(signed);
+
+      setTxHash(hash);
+      setMsg('✅ Submitted lock tx.');
+
+      // refresh displayed balance (after brief indexing delay)
+      setTimeout(async () => {
+        try {
+          const list = await provider.fetchAddressUTxOs(baseBech);
+          const sum = list.reduce((acc: number, u: any) => {
+            const q = Number(u.output.amount.find((a: any) => a.unit === 'lovelace')?.quantity ?? '0');
+            return acc + q;
+          }, 0);
+          const ada = sum / 1_000_000;
+          setAvailableAda(ada);
+          const buffer = Math.max(0.8, ada * 0.10);
+          setSafeMaxAda(Number(Math.max(0, ada - buffer).toFixed(6)));
+        } catch {}
+      }, 1500);
     } catch (err: any) {
-      console.error(err);
-      setMsg(err?.message ?? 'Failed to build/sign/submit.');
+      console.error('[lock] error', err);
+      setMsg(niceErr(err));
     } finally {
       setBusy(false);
     }
@@ -159,21 +230,14 @@ export default function ScriptSigClient() {
         Network: <b>{netId === 1 ? 'Mainnet' : 'Preprod Testnet'}</b> · Wallet: <b>{connected ? (name ?? 'Wallet') : '—'}</b>
       </p>
 
-      <div style={{ display: 'grid', gap: '10px', border: '1px solid #345', borderRadius: 12, padding: 12 }}>
-        <div><b>Your base address:</b> <code>{bech32 ?? '—'}</code></div>
+      <div style={{ display: 'grid', gap: 10, border: '1px solid #345', borderRadius: 12, padding: 12 }}>
+        <div><b>Your base address:</b> <code>{baseBech ?? '—'}</code></div>
         <div><b>Payment key hash:</b> <code>{keyHashHex ?? '—'}</code></div>
         <div><b>Native script (CBOR hex):</b> <code style={{ wordBreak: 'break-all' }}>{scriptCbor ?? '—'}</code></div>
         <div><b>Script address:</b> <code>{scriptAddr ?? '—'}</code></div>
-
-        {/* Explorer link should use the BASE address (per your request) */}
-        {bech32 && (
+        {baseBech && (
           <div>
-            <a
-              href={`${explorerBase}/address/${bech32}`}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: '#7fb3ff', textDecoration: 'underline' }}
-            >
+            <a href={`${explorerBase}/address/${baseBech}`} target="_blank" rel="noreferrer" style={{ color: '#7fb3ff', textDecoration: 'underline' }}>
               View base address on explorer
             </a>
           </div>
@@ -191,26 +255,68 @@ export default function ScriptSigClient() {
             style={{ padding: '10px 12px', border: '1px solid #567', borderRadius: 10, background: '#0a1020', color: '#d6e7ff' }}
           />
         </label>
-        <button
-          type="submit"
-          disabled={!scriptAddr || busy}
-          style={{
-            padding: '10px 14px',
-            borderRadius: 12,
-            border: '2px solid #2b6fff',
-            background: busy ? '#132039' : '#0a1020',
-            color: '#7fb3ff',
-            fontWeight: 800,
-            cursor: busy ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {busy ? 'Submitting…' : 'Lock ADA to Script'}
-        </button>
+
+        <div style={{ fontSize: 13, opacity: 0.85 }}>
+          {availableAda === null ? 'Available: —' : `Available: ${availableAda.toFixed(6)} ADA`}
+          {safeMaxAda !== null && <> · Safe max: <b>{safeMaxAda.toFixed(6)} ADA</b></>}
+          <span> · Tip: use ≥ 1.0 ADA for the script output.</span>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={() => safeMaxAda !== null && setAmountAda(safeMaxAda.toFixed(6))}
+            style={{ padding: '6px 10px', borderRadius: 10, border: '1px solid #567', background: '#0a1020', color: '#d6e7ff' }}
+          >
+            Use max
+          </button>
+
+          <button
+            type="submit"
+            disabled={!scriptAddr || busy}
+            style={{
+              padding: '10px 14px',
+              borderRadius: 12,
+              border: '2px solid #2b6fff',
+              background: busy ? '#132039' : '#0a1020',
+              color: '#7fb3ff',
+              fontWeight: 800,
+              cursor: busy ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {busy ? 'Submitting…' : 'Lock ADA to Script'}
+          </button>
+        </div>
       </form>
 
-      {msg && (
-        <div style={{ marginTop: 12, padding: 10, border: '1px solid #345', borderRadius: 8, background: 'rgba(43,111,255,0.06)' }}>
-          {msg}
+      {(msg || txHash) && (
+        <div
+          style={{
+            marginTop: '1rem',
+            padding: '10px 12px',
+            borderRadius: 10,
+            border: '1px solid rgba(127,179,255,0.35)',
+            background: 'rgba(43,111,255,0.06)',
+            color: '#cfe5ff',
+            whiteSpace: 'pre-wrap',
+            display: 'flex',
+            gap: 12,
+            alignItems: 'center',
+            flexWrap: 'wrap',
+          }}
+        >
+          <span>{msg}</span>
+          {txHash && (
+            <>
+              <code style={{ opacity: 0.8 }}>{txHash.slice(0, 10)}…{txHash.slice(-8)}</code>
+              <a href={`${explorerBase}/transaction/${txHash}`} target="_blank" rel="noreferrer" style={{ color: '#7fb3ff', textDecoration: 'underline' }}>
+                Open on Cardanoscan
+              </a>
+              <a href={`${cexplorerBase}/tx/${txHash}`} target="_blank" rel="noreferrer" style={{ color: '#7fb3ff', textDecoration: 'underline' }}>
+                Open on Cexplorer
+              </a>
+            </>
+          )}
         </div>
       )}
     </div>
