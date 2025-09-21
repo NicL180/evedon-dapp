@@ -2,8 +2,10 @@
 
 import { MeshProvider } from '@meshsdk/react';
 
+/**
+ * Global providers for the entire app.
+ * We keep it minimal: MeshProvider only (no react-query needed).
+ */
 export default function Providers({ children }: { children: React.ReactNode }) {
-  // MeshProvider gives us the wallet context for useWallet/useAddress/etc.
-  // No extra config required; network comes from the user’s wallet (Lace).
   return <MeshProvider>{children}</MeshProvider>;
 }

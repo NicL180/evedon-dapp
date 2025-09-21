@@ -5,8 +5,7 @@ import Analytics from './analytics';
 import { Suspense } from 'react';
 import Providers from './providers';
 import WalletMenu from './components/WalletMenu';
-
-
+import ThemeToggle from './components/ThemeToggle';
 
 export const metadata: Metadata = {
   title: 'Evedon',
@@ -17,7 +16,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   const GA_ID = 'G-12QDBHNG0T';
 
   return (
-    <html lang="en">
+    <html lang="en" className="theme-night">
       <head>
         {/* ✅ Google Analytics */}
         <Script
@@ -60,8 +59,22 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </h1>
           </header>
 
-          {/* 🔵 Neon Connect Wallet menu (fixed top-right) */}
-          <WalletMenu />
+          {/* Fixed top-right controls (always visible on every page) */}
+          <div
+            style={{
+              position: 'fixed',
+              top: 12,
+              right: 12,
+              zIndex: 3000,
+              display: 'flex',
+              alignItems: 'center',
+            }}
+          >
+            {/* Wallet button + inline eye toggle */}
+            <WalletMenu />
+            {/* Day/Night round icon (to the RIGHT) */}
+            <ThemeToggle />
+          </div>
 
           <Suspense fallback={null}>
             <Analytics />
